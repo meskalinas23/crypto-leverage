@@ -1,5 +1,5 @@
 """
-Crypto momentum screener: range breakout + retest, for Bybit USDT perpetuals.
+Crypto momentum screener: range breakout + retest, using Binance USDT-M Futures data.
 Scans top N coins by market cap, flags coins where:
   1. Price recently broke above a consolidation range (1h close above range high)
   2. Price retested that level and closed back above it (the entry trigger)
@@ -12,7 +12,6 @@ import time
 
 # ---- Config ----
 TOP_N_BY_MARKETCAP = 200
-INCLUDE_EXTRA = ["HYPEUSDT"]  # always include, even if outside top N by mcap on some sources
 RANGE_LOOKBACK = 40          # candles used to define the "consolidation range"
 BREAKOUT_LOOKBACK = 10       # how many recent candles to check for a breakout event
 MIN_RANGE_TIGHTNESS = 0.15   # range (high-low)/low must be under this to count as "consolidating"
@@ -20,72 +19,69 @@ RETEST_MAX_CANDLES = 6       # how many candles after breakout we allow for the 
 MIN_RISK_REWARD = 2.0
 REQUEST_PAUSE_SEC = 0.2
 
-BYBIT_BASE = "https://api.bytick.com"
+BINANCE_FUTURES_BASE = "https://fapi.binance.com"
 COINGECKO_BASE = "https://api.coingecko.com/api/v3"
+
+HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; screener-bot/1.0)"}
 
 
 def get_top_marketcap_symbols(n=TOP_N_BY_MARKETCAP):
-    """Pull top N coins by market cap from CoinGecko, return as BYBIT-style USDT perp symbols."""
+    """Pull top N coins by market cap from CoinGecko, return as Binance-style USDT symbols."""
     symbols = []
-    per_page = 250
     resp = requests.get(
         f"{COINGECKO_BASE}/coins/markets",
         params={
             "vs_currency": "usd",
             "order": "market_cap_desc",
-            "per_page": per_page,
+            "per_page": 250,
             "page": 1,
             "sparkline": "false",
         },
+        headers=HEADERS,
         timeout=15,
     )
     resp.raise_for_status()
     data = resp.json()
     for coin in data[:n]:
-        sym = coin["symbol"].upper() + "USDT"
-        symbols.append(sym)
-    for extra in INCLUDE_EXTRA:
-        if extra not in symbols:
-            symbols.append(extra)
+        symbols.append(coin["symbol"].upper() + "USDT")
     return symbols
 
 
-def get_bybit_tradeable_symbols():
-    """Get the set of USDT perpetual symbols actually tradeable on Bybit."""
+def get_binance_tradeable_symbols():
+    """Get the set of USDT perpetual symbols actually tradeable on Binance Futures."""
     resp = requests.get(
-        f"{BYBIT_BASE}/v5/market/instruments-info",
-        params={"category": "linear"},
+        f"{BINANCE_FUTURES_BASE}/fapi/v1/exchangeInfo",
+        headers=HEADERS,
         timeout=15,
     )
     resp.raise_for_status()
     data = resp.json()
     tradeable = set()
-    for item in data["result"]["list"]:
-        if item["status"] == "Trading" and item["symbol"].endswith("USDT"):
+    for item in data["symbols"]:
+        if item["status"] == "TRADING" and item["symbol"].endswith("USDT") and item["contractType"] == "PERPETUAL":
             tradeable.add(item["symbol"])
     return tradeable
 
 
-def get_klines(symbol, interval="60", limit=200):
-    """Fetch 1h candles from Bybit. Returns DataFrame oldest->newest."""
+def get_klines(symbol, interval="1h", limit=200):
+    """Fetch candles from Binance Futures. Returns DataFrame oldest->newest."""
     resp = requests.get(
-        f"{BYBIT_BASE}/v5/market/kline",
-        params={
-            "category": "linear",
-            "symbol": symbol,
-            "interval": interval,
-            "limit": limit,
-        },
+        f"{BINANCE_FUTURES_BASE}/fapi/v1/klines",
+        params={"symbol": symbol, "interval": interval, "limit": limit},
+        headers=HEADERS,
         timeout=15,
     )
     resp.raise_for_status()
-    data = resp.json()
-    rows = data["result"]["list"]
+    rows = resp.json()
     if not rows:
         return None
     df = pd.DataFrame(
         rows,
-        columns=["timestamp", "open", "high", "low", "close", "volume", "turnover"],
+        columns=[
+            "timestamp", "open", "high", "low", "close", "volume",
+            "close_time", "quote_volume", "trades", "taker_buy_base",
+            "taker_buy_quote", "ignore",
+        ],
     )
     df = df.astype(
         {
@@ -135,23 +131,21 @@ def detect_breakout_and_retest(df):
     if n < RANGE_LOOKBACK + BREAKOUT_LOOKBACK + RETEST_MAX_CANDLES:
         return None
 
-    # Scan candidate breakout candles in the recent window
     search_start = n - BREAKOUT_LOOKBACK - RETEST_MAX_CANDLES
     for i in range(search_start, n - 1):
         rng = find_range(df, lookback=RANGE_LOOKBACK, end_idx=i)
         if rng is None:
             continue
         if rng["tightness"] > MIN_RANGE_TIGHTNESS:
-            continue  # range wasn't tight enough to count as real consolidation
+            continue
 
         breakout_candle = df.iloc[i]
         if breakout_candle["close"] <= rng["high"]:
-            continue  # not a breakout candle
+            continue
 
-        # Look for a retest in the following candles
         for j in range(i + 1, min(i + 1 + RETEST_MAX_CANDLES, n)):
             candle = df.iloc[j]
-            dipped_into_zone = candle["low"] <= rng["high"] * 1.01  # touched back near the level
+            dipped_into_zone = candle["low"] <= rng["high"] * 1.01
             closed_above = candle["close"] > rng["high"]
             if dipped_into_zone and closed_above:
                 return {
@@ -163,7 +157,7 @@ def detect_breakout_and_retest(df):
                     "stop": rng["low"],
                 }
             if candle["close"] < rng["low"]:
-                break  # setup invalidated, range fully broken back below
+                break
     return None
 
 
@@ -182,7 +176,6 @@ def analyze_symbol(symbol):
     if risk <= 0:
         return None
 
-    # crude target: project the range height upward from the breakout level
     range_height = setup["range_high"] - setup["range_low"]
     target = setup["range_high"] + range_height * 2
     reward = target - entry
@@ -223,11 +216,11 @@ def main():
     mcap_symbols = get_top_marketcap_symbols()
     print(f"Got {len(mcap_symbols)} candidates from market cap list.")
 
-    print("Fetching Bybit tradeable symbols...")
-    tradeable = get_bybit_tradeable_symbols()
+    print("Fetching Binance Futures tradeable symbols...")
+    tradeable = get_binance_tradeable_symbols()
 
     symbols = [s for s in mcap_symbols if s in tradeable]
-    print(f"{len(symbols)} of those are tradeable as USDT perps on Bybit.")
+    print(f"{len(symbols)} of those are tradeable as USDT perps on Binance Futures.")
 
     btc_ctx = get_btc_context()
     if btc_ctx:
