@@ -1,9 +1,11 @@
 """
-Crypto momentum screener: range breakout + retest, using Binance USDT-M Futures data.
-Scans top N coins by market cap, flags coins where:
-  1. Price recently broke above a consolidation range (1h close above range high)
-  2. Price retested that level and closed back above it (the entry trigger)
-Also checks BTC's own range position as a loose market-context filter.
+Crypto momentum screener (CoinGecko version): range breakout + retest.
+Uses CoinGecko for both the top-N-by-market-cap list and hourly price history,
+since Bybit/Binance block direct API access from GitHub Actions' servers.
+
+Note: CoinGecko's free tier gives hourly PRICE POINTS, not full OHLC candles,
+so breakout/retest detection here is point-based rather than wick-based.
+Less precise than exchange candle data, but functional and not IP-blocked.
 """
 
 import requests
@@ -12,22 +14,20 @@ import time
 
 # ---- Config ----
 TOP_N_BY_MARKETCAP = 200
-RANGE_LOOKBACK = 40          # candles used to define the "consolidation range"
-BREAKOUT_LOOKBACK = 10       # how many recent candles to check for a breakout event
-MIN_RANGE_TIGHTNESS = 0.15   # range (high-low)/low must be under this to count as "consolidating"
-RETEST_MAX_CANDLES = 6       # how many candles after breakout we allow for the retest
+HISTORY_DAYS = 14             # how many days of hourly price history to pull per coin
+RANGE_LOOKBACK = 40           # points used to define the "consolidation range"
+BREAKOUT_LOOKBACK = 10        # how many recent points to check for a breakout event
+MIN_RANGE_TIGHTNESS = 0.15    # (high-low)/low must be under this to count as "consolidating"
+RETEST_MAX_POINTS = 6         # how many points after breakout we allow for the retest
 MIN_RISK_REWARD = 2.0
-REQUEST_PAUSE_SEC = 0.2
+REQUEST_PAUSE_SEC = 1.5       # CoinGecko free tier rate-limits fairly aggressively
 
-BINANCE_FUTURES_BASE = "https://fapi.binance.com"
 COINGECKO_BASE = "https://api.coingecko.com/api/v3"
-
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; screener-bot/1.0)"}
 
 
-def get_top_marketcap_symbols(n=TOP_N_BY_MARKETCAP):
-    """Pull top N coins by market cap from CoinGecko, return as Binance-style USDT symbols."""
-    symbols = []
+def get_top_coins(n=TOP_N_BY_MARKETCAP):
+    """Pull top N coins by market cap. Returns list of dicts with id + symbol."""
     resp = requests.get(
         f"{COINGECKO_BASE}/coins/markets",
         params={
@@ -42,58 +42,26 @@ def get_top_marketcap_symbols(n=TOP_N_BY_MARKETCAP):
     )
     resp.raise_for_status()
     data = resp.json()
-    for coin in data[:n]:
-        symbols.append(coin["symbol"].upper() + "USDT")
-    return symbols
+    return [{"id": c["id"], "symbol": c["symbol"].upper()} for c in data[:n]]
 
 
-def get_binance_tradeable_symbols():
-    """Get the set of USDT perpetual symbols actually tradeable on Binance Futures."""
+def get_hourly_prices(coin_id, days=HISTORY_DAYS):
+    """Fetch hourly price history for a coin. Returns DataFrame with timestamp, price."""
     resp = requests.get(
-        f"{BINANCE_FUTURES_BASE}/fapi/v1/exchangeInfo",
+        f"{COINGECKO_BASE}/coins/{coin_id}/market_chart",
+        params={"vs_currency": "usd", "days": days},
         headers=HEADERS,
         timeout=15,
     )
+    if resp.status_code == 429:
+        raise Exception("rate limited")
     resp.raise_for_status()
     data = resp.json()
-    tradeable = set()
-    for item in data["symbols"]:
-        if item["status"] == "TRADING" and item["symbol"].endswith("USDT") and item["contractType"] == "PERPETUAL":
-            tradeable.add(item["symbol"])
-    return tradeable
-
-
-def get_klines(symbol, interval="1h", limit=200):
-    """Fetch candles from Binance Futures. Returns DataFrame oldest->newest."""
-    resp = requests.get(
-        f"{BINANCE_FUTURES_BASE}/fapi/v1/klines",
-        params={"symbol": symbol, "interval": interval, "limit": limit},
-        headers=HEADERS,
-        timeout=15,
-    )
-    resp.raise_for_status()
-    rows = resp.json()
-    if not rows:
+    prices = data.get("prices", [])
+    if not prices:
         return None
-    df = pd.DataFrame(
-        rows,
-        columns=[
-            "timestamp", "open", "high", "low", "close", "volume",
-            "close_time", "quote_volume", "trades", "taker_buy_base",
-            "taker_buy_quote", "ignore",
-        ],
-    )
-    df = df.astype(
-        {
-            "timestamp": "int64",
-            "open": "float64",
-            "high": "float64",
-            "low": "float64",
-            "close": "float64",
-            "volume": "float64",
-        }
-    )
-    df = df.sort_values("timestamp").reset_index(drop=True)  # oldest -> newest
+    df = pd.DataFrame(prices, columns=["timestamp", "price"])
+    df = df.sort_values("timestamp").reset_index(drop=True)
     return df
 
 
@@ -105,33 +73,26 @@ def find_range(df, lookback=RANGE_LOOKBACK, end_idx=None):
     window = df.iloc[start_idx:end_idx]
     if len(window) < lookback // 2:
         return None
-    range_high = window["high"].max()
-    range_low = window["low"].min()
+    range_high = window["price"].max()
+    range_low = window["price"].min()
     if range_low <= 0:
         return None
     tightness = (range_high - range_low) / range_low
-    return {
-        "high": range_high,
-        "low": range_low,
-        "tightness": tightness,
-        "start_idx": start_idx,
-        "end_idx": end_idx,
-    }
+    return {"high": range_high, "low": range_low, "tightness": tightness}
 
 
 def detect_breakout_and_retest(df):
     """
-    Look through recent candles for:
-      1. A range (computed using candles BEFORE the breakout candle)
-      2. A breakout candle: closes above range high
-      3. A retest candle within RETEST_MAX_CANDLES: dips toward range high, closes back above it
-    Returns a dict describing the setup if found, else None.
+    Point-based version of the breakout+retest pattern:
+      1. A tight range (computed using points BEFORE the breakout point)
+      2. A breakout point: price above range high
+      3. A retest point within RETEST_MAX_POINTS: dips near range high, comes back above it
     """
     n = len(df)
-    if n < RANGE_LOOKBACK + BREAKOUT_LOOKBACK + RETEST_MAX_CANDLES:
+    if n < RANGE_LOOKBACK + BREAKOUT_LOOKBACK + RETEST_MAX_POINTS:
         return None
 
-    search_start = n - BREAKOUT_LOOKBACK - RETEST_MAX_CANDLES
+    search_start = n - BREAKOUT_LOOKBACK - RETEST_MAX_POINTS
     for i in range(search_start, n - 1):
         rng = find_range(df, lookback=RANGE_LOOKBACK, end_idx=i)
         if rng is None:
@@ -139,30 +100,28 @@ def detect_breakout_and_retest(df):
         if rng["tightness"] > MIN_RANGE_TIGHTNESS:
             continue
 
-        breakout_candle = df.iloc[i]
-        if breakout_candle["close"] <= rng["high"]:
+        breakout_price = df.iloc[i]["price"]
+        if breakout_price <= rng["high"]:
             continue
 
-        for j in range(i + 1, min(i + 1 + RETEST_MAX_CANDLES, n)):
-            candle = df.iloc[j]
-            dipped_into_zone = candle["low"] <= rng["high"] * 1.01
-            closed_above = candle["close"] > rng["high"]
-            if dipped_into_zone and closed_above:
+        for j in range(i + 1, min(i + 1 + RETEST_MAX_POINTS, n)):
+            price = df.iloc[j]["price"]
+            near_zone = price <= rng["high"] * 1.02
+            back_above = price > rng["high"]
+            if near_zone and back_above:
                 return {
                     "range_high": rng["high"],
                     "range_low": rng["low"],
-                    "breakout_idx": i,
-                    "retest_idx": j,
-                    "entry": candle["close"],
+                    "entry": price,
                     "stop": rng["low"],
                 }
-            if candle["close"] < rng["low"]:
+            if price < rng["low"]:
                 break
     return None
 
 
-def analyze_symbol(symbol):
-    df = get_klines(symbol)
+def analyze_coin(coin_id, symbol):
+    df = get_hourly_prices(coin_id)
     if df is None or len(df) < RANGE_LOOKBACK + BREAKOUT_LOOKBACK:
         return None
 
@@ -196,48 +155,44 @@ def analyze_symbol(symbol):
 
 def get_btc_context():
     """Loose market filter: is BTC near/above its own recent range high?"""
-    df = get_klines("BTCUSDT")
+    df = get_hourly_prices("bitcoin")
     if df is None:
         return None
     rng = find_range(df, lookback=RANGE_LOOKBACK, end_idx=len(df) - 1)
     if rng is None:
         return None
-    last_close = df.iloc[-1]["close"]
-    near_or_above = last_close >= rng["high"] * 0.98
+    last_price = df.iloc[-1]["price"]
+    near_or_above = last_price >= rng["high"] * 0.98
     return {
         "range_high": rng["high"],
-        "last_close": last_close,
+        "last_price": last_price,
         "near_or_above_breakout": near_or_above,
     }
 
 
 def main():
     print("Fetching top coins by market cap...")
-    mcap_symbols = get_top_marketcap_symbols()
-    print(f"Got {len(mcap_symbols)} candidates from market cap list.")
+    coins = get_top_coins()
+    print(f"Got {len(coins)} coins.")
 
-    print("Fetching Binance Futures tradeable symbols...")
-    tradeable = get_binance_tradeable_symbols()
-
-    symbols = [s for s in mcap_symbols if s in tradeable]
-    print(f"{len(symbols)} of those are tradeable as USDT perps on Binance Futures.")
-
+    print("Checking BTC context...")
     btc_ctx = get_btc_context()
     if btc_ctx:
         print(
-            f"BTC context: last close {btc_ctx['last_close']:.2f}, "
+            f"BTC context: last price {btc_ctx['last_price']:.2f}, "
             f"range high {btc_ctx['range_high']:.2f}, "
             f"near/above breakout: {btc_ctx['near_or_above_breakout']}"
         )
+    time.sleep(REQUEST_PAUSE_SEC)
 
     hits = []
-    for symbol in symbols:
+    for coin in coins:
         try:
-            result = analyze_symbol(symbol)
+            result = analyze_coin(coin["id"], coin["symbol"])
             if result:
                 hits.append(result)
         except Exception as e:
-            print(f"  skipped {symbol}: {e}")
+            print(f"  skipped {coin['symbol']}: {e}")
         time.sleep(REQUEST_PAUSE_SEC)
 
     print(f"\nFound {len(hits)} setups.\n")
