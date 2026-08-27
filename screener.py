@@ -20,7 +20,7 @@ RETEST_MAX_CANDLES = 6       # how many candles after breakout we allow for the 
 MIN_RISK_REWARD = 2.0
 REQUEST_PAUSE_SEC = 0.2
 
-BYBIT_BASE = "https://api.bybit.com"
+BYBIT_BASE = "https://api.bytick.com"
 COINGECKO_BASE = "https://api.coingecko.com/api/v3"
 
 
