@@ -170,6 +170,74 @@ def get_btc_context():
     }
 
 
+def write_html_report(hits, btc_ctx):
+    """Write results to docs/index.html for GitHub Pages."""
+    import datetime
+    import os
+
+    now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+
+    btc_html = ""
+    if btc_ctx:
+        status = "AT/NEAR BREAKOUT" if btc_ctx["near_or_above_breakout"] else "inside range"
+        btc_html = f"""
+        <p><strong>BTC:</strong> last price ${btc_ctx['last_price']:,.2f},
+        range high ${btc_ctx['range_high']:,.2f} &mdash; <strong>{status}</strong></p>
+        """
+
+    rows_html = ""
+    if hits:
+        for h in hits:
+            rows_html += f"""
+            <tr>
+                <td>{h['symbol']}</td>
+                <td>{h['entry']}</td>
+                <td>{h['stop']}</td>
+                <td>{h['target']}</td>
+                <td>{h['risk_reward']}:1</td>
+                <td>{h['range_low']} &ndash; {h['range_high']}</td>
+            </tr>
+            """
+        table_html = f"""
+        <table>
+            <thead>
+                <tr><th>Symbol</th><th>Entry</th><th>Stop</th><th>Target</th><th>R:R</th><th>Range</th></tr>
+            </thead>
+            <tbody>{rows_html}</tbody>
+        </table>
+        """
+    else:
+        table_html = "<p>No setups found this run.</p>"
+
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Crypto Momentum Screener</title>
+    <style>
+        body {{ font-family: -apple-system, Arial, sans-serif; max-width: 900px; margin: 20px auto; padding: 0 15px; }}
+        table {{ border-collapse: collapse; width: 100%; margin-top: 15px; }}
+        th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
+        th {{ background: #f5f5f5; }}
+        .updated {{ color: #666; font-size: 0.9em; }}
+    </style>
+</head>
+<body>
+    <h1>Crypto Momentum Screener</h1>
+    <p class="updated">Last updated: {now}</p>
+    {btc_html}
+    <h2>Setups ({len(hits)})</h2>
+    {table_html}
+</body>
+</html>
+"""
+    os.makedirs("docs", exist_ok=True)
+    with open("docs/index.html", "w") as f:
+        f.write(html)
+    print("Wrote docs/index.html")
+
+
 def main():
     print("Fetching top coins by market cap...")
     coins = get_top_coins()
@@ -204,6 +272,8 @@ def main():
                 f"| {h['symbol']} | {h['entry']} | {h['stop']} | {h['target']} | "
                 f"{h['risk_reward']}:1 | {h['range_low']}-{h['range_high']} |"
             )
+
+    write_html_report(hits, btc_ctx)
 
 
 if __name__ == "__main__":
