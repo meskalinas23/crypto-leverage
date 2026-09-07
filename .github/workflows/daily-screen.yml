@@ -5,6 +5,9 @@ on:
     - cron: "5 * * * *"
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   screen:
     runs-on: ubuntu-latest
@@ -22,3 +25,11 @@ jobs:
 
       - name: screen
         run: python screener.py
+
+      - name: Commit and push report
+        run: |
+          git config user.name "screener-bot"
+          git config user.email "screener-bot@users.noreply.github.com"
+          git add docs/index.html
+          git diff --quiet && git diff --staged --quiet || git commit -m "Update screener results"
+          git push
