@@ -25,19 +25,20 @@ def test_connection():
 
 
 def test_leaderboard():
-    """Try pulling the public leaderboard too - this is what we'd need for whale discovery."""
+    """The real leaderboard lives on a separate stats endpoint, not /info."""
     try:
-        resp = requests.post(
-            HYPERLIQUID_API,
-            json={"type": "leaderboard"},
-            headers={"Content-Type": "application/json"},
+        resp = requests.get(
+            "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard",
+            headers={"User-Agent": "Mozilla/5.0 (compatible; screener-bot/1.0)"},
             timeout=15,
         )
         resp.raise_for_status()
         data = resp.json()
-        print(f"Leaderboard endpoint responded. Type: {type(data)}, sample: {str(data)[:300]}")
+        rows = data.get("leaderboardRows", data if isinstance(data, list) else [])
+        print(f"SUCCESS: leaderboard endpoint responded. Rows found: {len(rows) if isinstance(rows, list) else 'unknown shape'}")
+        print("Sample:", str(rows[:1] if isinstance(rows, list) else data)[:500])
     except Exception as e:
-        print(f"Leaderboard endpoint failed or doesn't exist as expected: {e}")
+        print(f"Leaderboard endpoint failed: {e}")
 
 
 def test_dexscreener():
